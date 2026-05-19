@@ -7,7 +7,7 @@
 
 # Obtain the absolute path where the current script is located to prevent path confusion
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="${SCRIPT_DIR}/run_quality_raw_event.py"
+PYTHON_SCRIPT="${SCRIPT_DIR}/compute_event_rates.py"
 
 # add missing record file
 MISSING_FILE="${SCRIPT_DIR}/missing_runs.txt"
