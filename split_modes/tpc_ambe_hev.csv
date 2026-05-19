@@ -1,0 +1,2 @@
+Run_ID,mode,Start_Date,Livetime_sec,Gate_Event_Count,Gate_Event_Rate_Hz,Cathode_Event_Count,Cathode_Event_Rate_Hz,S1_Only_Heavy_Count,S1_Only_Heavy_Rate_Hz,S2_Only_SE_Count,S2_Only_SE_Rate_Hz,Wall_Event_Count,Wall_Event_Rate_Hz,start,end
+055909,tpc_ambe_hev,2023-11-16 11:36:08.219,901.003,855,0.9489424563514216,1884,2.0910030266269923,0,0.0,1006,1.1165334632626085,13460,14.938906973672673,2023-11-16 11:36:08.219,2023-11-16 11:51:09.222

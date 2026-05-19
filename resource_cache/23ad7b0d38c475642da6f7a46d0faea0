@@ -1,0 +1,212 @@
+def blinding_v24(data, run_id, target):
+    """
+    Unblind fully SR1a and SR1b ER, and NR band for the _wimp tagged runs.
+    Unblind fully _sr2_preliminary ER.
+    
+    This function only works on event_info (or event_info + other targets). For
+    each chunk of data, it computes the energies in said data. All fields in the
+    data (except for time fields) are set to zero if the energy of an event is
+    either in either of the blinding regions of Low ER or 0vbb
+
+    :param data: (np.ndarray) A chunk of data. We still need to check if the
+        data is actually event_info.
+    :param run_id: (str) The run_id of the chunk
+    :param target: (tuple, list or str) a list/tuple or string of the data-types
+        of the chunk of data
+    :return: (np.ndarray) the blinded chunk of data.
+    """
+    if "event_info" not in target:
+        return data
+
+    # make sure the modules are loaded
+    import utilix
+    import numpy as np
+    import straxen
+
+    run_col = utilix.xent_collection()
+
+    def get_rundoc(_run_id, store_fields=('number', 'source', 'tags')):
+        """For a given run, get each of the fields in store_fields"""
+        cache_name = f'_rd_{_run_id}'
+        # Only query once since we might need this every chunk.
+        if cache_name not in straxen.common._resource_cache:
+            run_doc = run_col.find_one({'number': int(_run_id)},
+                                       projection={f: True for f in store_fields})
+            if run_doc is None:
+                # Don't query XENON1T runs!
+                raise ValueError(f'The query for {_run_id} failed')
+            straxen.common._resource_cache[cache_name] = run_doc
+
+        return straxen.common._resource_cache[cache_name]
+
+    def poln(x, ps):
+        """compute a polynomial as function of data x for given coefficients ps"""
+        y = sum([p * x ** n for n, p in enumerate(ps)])
+        return y
+
+    # Check whether our data mode has "tpc_bkg":
+    # and whether tag is _never_blinded:
+    rd = get_rundoc(run_id, store_fields=('number', 'source', 'tags'))
+    tags = rd.get("tags", [])
+    tags = [t['name'] for t in tags]
+    source = rd["source"]
+
+    unblind_er_tags = ['_never_blinded', '_sr0_ted', '_sr0', '_sr1a', '_sr1b', '_sr2_preliminary']
+    unblind_nr_wimp_tags = ['_never_blinded', '_sr0_ted', '_sr0', '_wimp']
+    unblind_nr_cevns_tags = ['_never_blinded', '_cevns']
+    unblind_0vbb_ss_tags = ['_never_blinded']
+    unblind_0vbb_ms_tags = ['_never_blinded', '_sr0_ted', '_sr0']
+    is_not_background = source not in ['None', 'none']
+
+    keep_er_blinded = not any([t in tags for t in unblind_er_tags])
+    keep_nr_wimp_blinded = not any([t in tags for t in unblind_nr_wimp_tags])
+    keep_nr_cevns_blinded = not any([t in tags for t in unblind_nr_cevns_tags])
+    keep_0vbb_ss_blinded = not any([t in tags for t in unblind_0vbb_ss_tags])
+    keep_0vbb_ms_blinded = not any([t in tags for t in unblind_0vbb_ms_tags])
+
+    if is_not_background:
+        return data
+
+    # Make sure we can overwrite the data (since it's event_info it should be small).
+    # Chunks are generally read-only
+    if not data.flags.writeable:
+        data = data.copy()
+
+    # -- Data to blind --
+    # polynomial fit to ER band template and 500 GeV WIMP template
+    # from Zihao
+    # ER band -2sig
+    # xenon:xenonnt:zihao:bbf_sr0_er_only_fit_20220606
+    pols_er_dn = [831.1276086453832, 26.651901027783435, -0.0820857025215196, 0.0001486800544713463]
+    pols_er_up = [1923.5426838009312, 41.125640535051325, -0.08795557392652625, 0.00017573601374614624]
+    # NR (500 GeV WIMP) band -2sig
+    # xenon:xenon1t:hoetzsch:bbf:bbf_nrfitsr0:nrfit_firstresults_ws2merging
+    pols_nr_dn = [-91.43289, 2.55680985e+01, -8.50375049e-02, 1.04905857e-04]
+
+    # Blinding constants
+    # xenon:xenonnt:analysis:ntsciencerun0:g1g2_conservative_error#result, Fit with 3.2% systematic Qy uncertainty
+    # TODO: g1, g2 values might need to be updated for SR1a-phase0
+    g1 = 0.15149  # PE/ph
+    g2 = 16.45  # PE/e
+    W = 13.7e-3  # keV
+    cs1_min = 1  # PE
+    e_max_low_er = 10  # keV
+    e_min_0vbb = 2258  # keV
+    e_max_0vbb = 2558  # keV
+    blinded_r = (0, 63.0)  # cm
+    #FV optimised for ER extends to 63cm https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenonnt:analysis:ntsciencerun0:fiducial_volume
+
+    data_energies = W * (data["cs1"] / g1 + data["cs2"] / g2)
+
+    # by default unblind everything
+    # then will check different signal regions and apply different blindings below
+    blinding_sel = np.zeros(len(data), dtype=bool)
+
+    # few band-agnostic blinding cuts. will be included in specific unblindings
+    # only blind within TPC
+    blinding_radius = ((blinded_r[0] <= data['r']) & (data['r'] <= blinded_r[1]))
+    # cs1 requirement, cs1 < 1 PE already unblinded in https://github.com/XENONnT/private_nt_aux_files/pull/208
+    blinding_cs1 = data["cs1"] > cs1_min
+
+    # Explicitly blind CEvNS ROI, where s1_n_hits <= 3 and s2_area < 500 PE
+    # https://xe1t-wiki.lngs.infn.it/doku.php?id=xenon:xenonnt:b8:signal_model
+    blinding_cevns_s1_n_hits = 3
+    blinding_cevns_s2_area = 500
+
+    # blind in NR band (3 fold):
+    if keep_nr_wimp_blinded:
+        # to avoid overlap with cevns
+        blinding_nr_wimp = ~((data["s1_n_hits"] <= blinding_cevns_s1_n_hits) & (data["s2_area"] < blinding_cevns_s2_area))
+        blinding_nr_wimp &= data["cs2"] < poln(data["cs1"], pols_er_dn)
+        blinding_nr_wimp &= data["cs2"] > poln(data["cs1"], pols_nr_dn)
+        # blind below certain energy
+        blinding_nr_wimp &= data_energies < e_max_low_er
+        # only blind within TPC
+        blinding_nr_wimp &= blinding_radius
+        # cs1 requirement, cs1 < 1 PE already unblinded in https://github.com/XENONnT/private_nt_aux_files/pull/208
+        blinding_nr_wimp &= blinding_cs1
+        blinding_sel |= blinding_nr_wimp
+
+    # blind in CEvNS ROI:
+    if keep_nr_cevns_blinded:
+        blinding_nr_cevns = data["s1_n_hits"] <= blinding_cevns_s1_n_hits
+        blinding_nr_cevns &= data["s2_area"] < blinding_cevns_s2_area
+        # only blind within TPC
+        blinding_nr_cevns &= blinding_radius
+        blinding_sel |= blinding_nr_cevns
+
+    if keep_er_blinded:
+        blinding_er = data["cs2"] > poln(data["cs1"], pols_er_dn)
+        blinding_er &= data["cs2"] < poln(data["cs1"], pols_er_up)
+        blinding_er &= data_energies < e_max_low_er # keV
+        blinding_er &= blinding_radius
+        blinding_er &= blinding_cs1
+        blinding_sel |= blinding_er
+
+
+    # Single scatter / Multiple scatter discrimation cut from
+    # https://github.com/XENONnT/cutax/blob/master/cutax/cuts/s2_single_scatter.py
+    min_allowed_alt_s2_area_offset_low_s2 = {'sr0': 150,
+                    'sr1': 200}
+
+    min_allowed_alt_s2_area_slope_low_s2 = {'sr0': 0.00153,
+                    'sr1': 0.0143}
+
+    min_allowed_alt_s2_area_offset_high_s2 = {'sr0': 310,
+                    'sr1': 210}
+
+    min_allowed_alt_s2_area_slope_high_s2 = {'sr0': 0.00230,
+                    'sr1': 0.01200}
+
+    boundary_low_and_high_s2 = {'sr0': 30000,
+                    'sr1': 30000}
+
+    coeffcient_fermi_dirac = {'sr0': 5e-4,
+                    'sr1': 5e-4}
+
+    sr = 'sr0' 
+    # TODO: Would need a function to tells if the run_id is SR0 or SR1 or SRX
+    # TODO: This way we will be able to extend the unblinding procedure for 0vbb 
+    # TODO: easily for the next science runs.
+
+    def fermi_dirac_low_s2(s2_area, k, b, bound, coeff):
+        return (k*s2_area + b)/( 1 + np.exp(coeff * (s2_area-bound)))
+
+    def fermi_dirac_high_s2(s2_area, k, b, bound, coeff):
+        return (k*s2_area + b)/( 1 + np.exp(coeff * (bound-s2_area)))
+
+    def s2_single_scatter_cut(s2_area):
+            max_allowed_alt_s2_area = fermi_dirac_low_s2(s2_area, 
+                                                            min_allowed_alt_s2_area_slope_low_s2[sr],
+                                                            min_allowed_alt_s2_area_offset_low_s2[sr],
+                                                            boundary_low_and_high_s2[sr],
+                                                            coeffcient_fermi_dirac[sr])
+            max_allowed_alt_s2_area += fermi_dirac_high_s2(s2_area, 
+                                                                min_allowed_alt_s2_area_slope_high_s2[sr],
+                                                                min_allowed_alt_s2_area_offset_high_s2[sr],
+                                                                boundary_low_and_high_s2[sr],
+                                                                coeffcient_fermi_dirac[sr])
+            return max_allowed_alt_s2_area
+
+    if keep_0vbb_ss_blinded:
+        # Blind SS events in 0vbb ROI:
+        blinding_ss_0vbb = (e_min_0vbb < data_energies) & (data_energies < e_max_0vbb)
+        # Blinding only single scatter events
+        blinding_ss_0vbb &= ~(data["alt_s2_area"] > s2_single_scatter_cut(data["s2_area"])) 
+        blinding_sel |= blinding_ss_0vbb
+
+    if keep_0vbb_ms_blinded:
+        # Blind MS events in 0vbb ROI:
+        blinding_ms_0vbb = (e_min_0vbb < data_energies) & (data_energies < e_max_0vbb)
+        # Blinding only single scatter events
+        blinding_ms_0vbb &= ~(data["alt_s2_area"] < s2_single_scatter_cut(data["s2_area"])) 
+        blinding_sel |= blinding_ms_0vbb
+
+    for set_to_zero in data.dtype.names:
+        # Let's just set everything to zero to prevent any missed fields like e_light
+        if set_to_zero in 'time endtime'.split():
+            # Don't change time-info
+            continue
+        zero_for_field = np.zeros(1, dtype=data.dtype[set_to_zero])[0]
+        data[set_to_zero][blinding_sel] = zero_for_field
+    return data
